@@ -20,6 +20,18 @@ from sklearn.metrics import (
 )
 
 # =========================================================
+# "DEFAULT BEST" 운영 베이스라인 고정
+# =========================================================
+DEFAULT_BASELINE = dict(
+    tag="H1_60",
+    horizons=(1, 60),
+    L_enc=192,
+    L_pred=60,
+    prior_beta=0.30,
+    prior_sigmas=(8.0, 32.0, 96.0),
+)
+
+# =========================================================
 # DDP utils
 # =========================================================
 def dist_is_init() -> bool:
@@ -354,7 +366,95 @@ def qname(q: float) -> str:
     return f"q{int(round(q * 100)):02d}"
 
 # =========================================================
+# EMA normalizer (DDP-consistent)
+# =========================================================
+def _ddp_global_mean_var(x: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    x: (B,) float tensor
+    returns global mean/var across ranks (DDP-safe)
+    NOTE: 반드시 scalar(0-d) mean/var 반환해야 buffer(copy_)와 shape 맞음
+    """
+    x32 = x.detach().to(torch.float32)
+
+    s  = x32.sum()                 # scalar []
+    ss = (x32 * x32).sum()         # scalar []
+    n  = torch.tensor(float(x32.numel()), device=x.device, dtype=torch.float32)  # scalar []
+
+    if dist_is_init():
+        dist.all_reduce(s,  op=dist.ReduceOp.SUM)
+        dist.all_reduce(ss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(n,  op=dist.ReduceOp.SUM)
+
+    n = n.clamp_min(1.0)
+    mean = s / n                   # scalar []
+    var  = (ss / n) - (mean * mean)
+    var  = var.clamp_min(eps)
+    return mean, var
+
+class ResidualEmaNormBank(nn.Module):
+    """
+    Per-horizon, per-feature EMA(mean/var) tracker.
+    feature dim = 4 (abs, signed, trend, var)
+    """
+    def __init__(self, horizons: Tuple[int, ...], n_feat: int = 4, eps: float = 1e-6):
+        super().__init__()
+        self.horizons = tuple(int(k) for k in horizons)
+        self.n_feat = int(n_feat)
+        self.eps = float(eps)
+
+        for k in self.horizons:
+            for fi in range(self.n_feat):
+                self.register_buffer(f"mu_k{k}_f{fi}", torch.zeros((), dtype=torch.float32))
+                self.register_buffer(f"va_k{k}_f{fi}", torch.ones((), dtype=torch.float32))
+
+    def _get(self, k: int, fi: int):
+        mu = getattr(self, f"mu_k{k}_f{fi}")
+        va = getattr(self, f"va_k{k}_f{fi}")
+        return mu, va
+
+    def _set(self, k: int, fi: int, mu: torch.Tensor, va: torch.Tensor):
+        getattr(self, f"mu_k{k}_f{fi}").copy_(mu)
+        getattr(self, f"va_k{k}_f{fi}").copy_(va)
+
+    @torch.no_grad()
+    def update(self, k: int, feats_bf: torch.Tensor, m: float):
+        """
+        feats_bf: (B, F) raw scores
+        m: momentum (e.g. 0.995)
+        """
+        k = int(k)
+        if k not in self.horizons:
+            return
+        m = float(m)
+        F = feats_bf.size(1)
+        for fi in range(F):
+            x = feats_bf[:, fi]
+            mean, var = _ddp_global_mean_var(x, eps=self.eps)
+            mu0, va0 = self._get(k, fi)
+            mu_new = m * mu0 + (1.0 - m) * mean
+            va_new = m * va0 + (1.0 - m) * var
+            self._set(k, fi, mu_new, va_new)
+
+    def norm(self, k: int, feats_bf: torch.Tensor) -> torch.Tensor:
+        """
+        feats_bf: (B, F)
+        return normalized (B,F)
+        """
+        k = int(k)
+        if k not in self.horizons:
+            return feats_bf
+        outs = []
+        for fi in range(feats_bf.size(1)):
+            mu, va = self._get(k, fi)
+            mu = mu.to(feats_bf.device)
+            va = va.to(feats_bf.device)
+            z = (feats_bf[:, fi] - mu) / torch.sqrt(va + self.eps)
+            outs.append(z)
+        return torch.stack(outs, dim=1)
+
+# =========================================================
 # Informer + Heads (reg + cls, quantile)
+# + residual fusion params (gating/MLP)
 # =========================================================
 class InformerMT(nn.Module):
     def __init__(
@@ -376,6 +476,7 @@ class InformerMT(nn.Module):
         quantiles: Tuple[float, ...] = (0.1, 0.5, 0.9),
         prior_mix_k: int = 3,
         L_label: int = 0,
+        rs_eps: float = 1e-6,
     ):
         super().__init__()
         self.L_label = int(L_label)
@@ -412,6 +513,24 @@ class InformerMT(nn.Module):
         self.prior_alpha_logits = nn.ParameterDict({
             str(k): nn.Parameter(torch.zeros(self.prior_mix_k)) for k in self.horizons_idx
         })
+
+        # --- residual fusion params ---
+        self.gate_w = nn.ParameterDict({str(k): nn.Parameter(torch.tensor(1.0)) for k in self.horizons_idx})
+        self.gate_b = nn.ParameterDict({str(k): nn.Parameter(torch.tensor(0.0)) for k in self.horizons_idx})
+
+        # mlp late fusion: delta_logit = MLP(res_feat_norm)
+        self.rs_mlp = nn.ModuleDict({
+            str(k): nn.Sequential(
+                nn.Linear(4, 16),
+                nn.GELU(),
+                nn.Dropout(0.1),
+                nn.Linear(16, 1),
+            )
+            for k in self.horizons_idx
+        })
+
+        # EMA norm bank (per horizon, 4 residual features)
+        self.rs_norm_bank = ResidualEmaNormBank(self.horizons_idx, n_feat=4, eps=rs_eps)
 
     def forward(self, x_enc, t_enc, x_dec, t_dec, return_assoc=False, return_enc_attn=False):
         if self.use_checkpoint and self.training:
@@ -532,17 +651,37 @@ class TrainCfg:
     cls_err_mode: str = "l1"  # l1 or l2
 
     use_point_adjust: bool = True
-
-    use_residual_boost: bool = True
-    residual_boost_alpha: float = 1.0
-    residual_horizon_weight_mode: str = "inv"  # inv|exp|uniform
-    residual_feature_robust: bool = True
-    residual_eps: float = 1e-6
-
     use_event_metrics: bool = True
 
     debug_ad: bool = True
     debug_every: int = 200
+
+    # =====================================================
+    # Residual features (4 components)
+    # =====================================================
+    residual_feature_robust: bool = True
+    residual_eps: float = 1e-6
+
+    residual_use_abs: bool = True
+    residual_use_signed: bool = True
+    residual_use_trend: bool = True
+    residual_use_var: bool = True
+
+    residual_w_abs: float = 1.0
+    residual_w_signed: float = 0.5
+    residual_w_trend: float = 0.5
+    residual_w_var: float = 0.3
+
+    # =====================================================
+    # Residual normalization & fusion
+    # =====================================================
+    residual_norm_mode: str = "ema"
+    rs_ema_m: float = 0.995
+
+    residual_fusion: str = "gating"
+    residual_boost_alpha: float = 1.0
+    gate_lambda: float = 0.15
+    gate_p_eps: float = 1e-6
 
 # =========================================================
 # helpers (loss terms)
@@ -590,7 +729,7 @@ def _js_divergence(p, q, dim=-1, eps=1e-8):
     return 0.5 * (kl_pm + kl_qm)
 
 # =========================================================
-# Residual score helpers
+# Residual score helpers (4 components)
 # =========================================================
 def _make_horizon_weights(k: int, mode: str, device):
     mode = (mode or "inv").lower()
@@ -615,20 +754,128 @@ def _robust_scale_abs_err(abs_err_btD: torch.Tensor, eps: float = 1e-6) -> torch
     z = (abs_err_btD - med.view(1, 1, D)) / mad.view(1, 1, D)
     return z.clamp_min(0.0)
 
-def _residual_horizon_score(yhat_btD: torch.Tensor, y_btD: torch.Tensor, k: int, cfg) -> torch.Tensor:
+def _abs_horizon_score(yhat_btD: torch.Tensor, y_btD: torch.Tensor, k: int, cfg) -> torch.Tensor:
     abs_err = (yhat_btD[:, :k, :] - y_btD[:, :k, :]).abs()
     if bool(getattr(cfg, "residual_feature_robust", True)):
         scaled = _robust_scale_abs_err(abs_err, eps=float(getattr(cfg, "residual_eps", 1e-6)))
     else:
         scaled = abs_err
     step_score = scaled.sum(dim=2)  # (B,k)
-    w = _make_horizon_weights(k, getattr(cfg, "residual_horizon_weight_mode", "inv"), device=yhat_btD.device)
+    w = _make_horizon_weights(k, "inv", device=yhat_btD.device)
     return (step_score * w.view(1, k)).sum(dim=1)
 
-def _zscore(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+def _signed_drift_score(yhat_btD: torch.Tensor, y_btD: torch.Tensor, k: int, eps: float = 1e-6) -> torch.Tensor:
+    if k <= 0:
+        return torch.zeros((yhat_btD.size(0),), device=yhat_btD.device, dtype=yhat_btD.dtype)
+    e = (yhat_btD[:, :k, :] - y_btD[:, :k, :])          # (B,k,D)
+    m = e.mean(dim=2)                                    # (B,k)
+    S = m.sum(dim=1)                                     # (B,)
+    return S.abs()
+
+def _trend_break_score(yhat_btD: torch.Tensor, y_btD: torch.Tensor, k: int, eps: float = 1e-6) -> torch.Tensor:
+    if k <= 1:
+        return torch.zeros((yhat_btD.size(0),), device=yhat_btD.device, dtype=yhat_btD.dtype)
+    yh = yhat_btD[:, :k, :]
+    yt = y_btD[:, :k, :]
+    dyh = yh[:, 1:, :] - yh[:, :-1, :]                  # (B,k-1,D)
+    dy  = yt[:, 1:, :] - yt[:, :-1, :]                  # (B,k-1,D)
+
+    num = (dyh * dy).sum(dim=2)                          # (B,k-1)
+    den = (dyh.norm(dim=2) * dy.norm(dim=2)).clamp_min(eps)
+    cos = (num / den).clamp(-1.0, 1.0)                   # (B,k-1)
+    return (1.0 - cos).mean(dim=1)                       # (B,)
+
+def _var_shift_score(yhat_btD: torch.Tensor, y_btD: torch.Tensor, k: int, eps: float = 1e-6) -> torch.Tensor:
+    if k <= 1:
+        return torch.zeros((yhat_btD.size(0),), device=yhat_btD.device, dtype=yhat_btD.dtype)
+    yh = yhat_btD[:, :k, :]
+    yt = y_btD[:, :k, :]
+    vp = yh.var(dim=1, unbiased=False).mean(dim=1)       # (B,)
+    vt = yt.var(dim=1, unbiased=False).mean(dim=1)       # (B,)
+    return (torch.log((vp + eps) / (vt + eps))).abs()
+
+def _residual_features_4(yhat_btD: torch.Tensor, y_btD: torch.Tensor, k: int, cfg) -> torch.Tensor:
+    """
+    returns (B,4): [abs, signed, trend, var]
+    """
+    eps = float(getattr(cfg, "residual_eps", 1e-6))
+    feats = []
+    feats.append(_abs_horizon_score(yhat_btD, y_btD, k, cfg))
+    feats.append(_signed_drift_score(yhat_btD, y_btD, k, eps=eps))
+    feats.append(_trend_break_score(yhat_btD, y_btD, k, eps=eps))
+    feats.append(_var_shift_score(yhat_btD, y_btD, k, eps=eps))
+    return torch.stack(feats, dim=1)
+
+def _batch_zscore(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     mu = x.mean()
     sd = x.std(unbiased=False).clamp_min(eps)
     return (x - mu) / sd
+
+def _combine_rs_scalar(feat_b4_norm: torch.Tensor, cfg: TrainCfg) -> torch.Tensor:
+    """
+    weighted sum -> (B,)
+    """
+    w = torch.tensor(
+        [cfg.residual_w_abs, cfg.residual_w_signed, cfg.residual_w_trend, cfg.residual_w_var],
+        device=feat_b4_norm.device,
+        dtype=torch.float32
+    )
+    w = w / (w.sum() + 1e-12)
+    return (feat_b4_norm.to(torch.float32) * w.view(1, 4)).sum(dim=1).to(feat_b4_norm.dtype)
+
+def _prob_to_logit(p: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    p = p.clamp(eps, 1.0 - eps)
+    return torch.log(p / (1.0 - p))
+
+def apply_residual_fusion(
+    model: InformerMT,
+    cfg: TrainCfg,
+    logits_b: torch.Tensor,
+    feat_b4_raw: torch.Tensor,
+    horizon_k: int,
+    update_ema: bool,
+) -> torch.Tensor:
+    """
+    logits_b: (B,) base logits (possibly already AD-boosted)
+    feat_b4_raw: (B,4) raw residual features
+    """
+    k = int(horizon_k)
+    mode_norm = (cfg.residual_norm_mode or "ema").lower()
+    mode_fuse = (cfg.residual_fusion or "gating").lower()
+
+    # choose normalized features
+    if mode_norm == "batch":
+        feat_norm = torch.stack([_batch_zscore(feat_b4_raw[:, i], eps=cfg.residual_eps) for i in range(4)], dim=1)
+    elif mode_norm == "none":
+        feat_norm = feat_b4_raw
+    else:
+        # EMA
+        if update_ema and model.training:
+            model.rs_norm_bank.update(k, feat_b4_raw, m=cfg.rs_ema_m)
+        feat_norm = model.rs_norm_bank.norm(k, feat_b4_raw)
+
+    rs_scalar = _combine_rs_scalar(feat_norm, cfg)  # (B,)
+
+    if mode_fuse == "logit_add":
+        return logits_b + float(cfg.residual_boost_alpha) * rs_scalar
+
+    if mode_fuse == "mlp":
+        if str(k) not in model.rs_mlp:
+            return logits_b
+        delta = model.rs_mlp[str(k)](feat_norm.to(torch.float32)).squeeze(-1).to(logits_b.dtype)
+        return logits_b + delta
+
+    # gating (default)
+    if str(k) not in model.gate_w:
+        return logits_b
+    p0 = torch.sigmoid(logits_b)
+    w = model.gate_w[str(k)].to(p0.dtype)
+    b = model.gate_b[str(k)].to(p0.dtype)
+    g = torch.sigmoid(w * rs_scalar + b)  # (B,) 0..1
+    lam = float(cfg.gate_lambda)
+    p = p0 * (1.0 + lam * (g - 0.5) * 2.0)
+    logits_new = _prob_to_logit(p, eps=float(cfg.gate_p_eps)).to(logits_b.dtype)
+    return logits_new
 
 # =========================================================
 # Event metrics
@@ -662,6 +909,26 @@ def _event_metrics(y_true: np.ndarray, y_pred: np.ndarray):
     P = hit_pred / len(pred_segs)
     F1 = 0.0 if (P + R) == 0 else (2 * P * R / (P + R))
     return float(P), float(R), float(F1)
+
+def pad_splat_scores_by_true_segments(y_true_01: np.ndarray, scores: np.ndarray) -> np.ndarray:
+
+    y = y_true_01.astype(np.int64)
+    s = scores.astype(np.float64).copy()
+
+    n = len(y)
+    i = 0
+    while i < n:
+        if y[i] == 1:
+            j = i + 1
+            while j < n and y[j] == 1:
+                j += 1
+            m = np.nanmax(s[i:j]) if (j > i) else np.nan
+            if np.isfinite(m):
+                s[i:j] = m
+            i = j
+        else:
+            i += 1
+    return s
 
 # =========================================================
 # results.csv appender
@@ -860,8 +1127,9 @@ def train_one_epoch(model, revin, loader, opt, scaler, cfg: TrainCfg, epoch: int
                 teacher_prob=tfp,
                 train_mode=True
             )
-            y_pred = _denorm_if_needed(pred_n, revin, stats, cfg.use_revin)
+            y_pred = _denorm_if_needed(pred_n, revin, stats, cfg.use_revin)  # (B,K,D) original space
 
+            # one-shot forward for q heads + cls head + assoc
             dec_in_full = torch.cat([x_dec_n[:, :cfg.L_label, :], torch.zeros_like(y_n)], dim=1)
             y_reg_q, y_cls_logits, assoc_last, enc_attn_list, _ = model(
                 x_enc_n, t_enc, dec_in_full, t_dec,
@@ -869,7 +1137,7 @@ def train_one_epoch(model, revin, loader, opt, scaler, cfg: TrainCfg, epoch: int
                 return_enc_attn=False
             )
 
-            # Quantile regression loss
+            # Quantile regression loss (Δ -> cumsum)
             loss_q = 0.0
             for qk in q_keys:
                 delta_list = []
@@ -911,7 +1179,7 @@ def train_one_epoch(model, revin, loader, opt, scaler, cfg: TrainCfg, epoch: int
                     thr = torch.quantile(score.detach(), 1.0 - cls_pos_rate)
                     y_cls_targets[str(kk)] = (score.detach() >= thr).float()
 
-            # AD loss + boost (js_list 정리 유지)
+            # AD loss
             loss_ad = torch.tensor(0.0, device=cfg.device)
             ad_boost = {str(int(k)): torch.zeros(B, device=cfg.device) for k in cfg.horizons}
             js_list = []
@@ -939,17 +1207,10 @@ def train_one_epoch(model, revin, loader, opt, scaler, cfg: TrainCfg, epoch: int
                 if len(js_list) > 0:
                     loss_ad = torch.stack(js_list, dim=0).mean()
 
-            # residual boost
-            if bool(getattr(cfg, "use_residual_boost", True)) and float(getattr(cfg, "residual_boost_alpha", 0.0)) != 0.0:
-                yhat = y_reg_q.get(qname(0.5), None)
-                if yhat is not None:
-                    for kk in cfg.horizons:
-                        kk = int(kk)
-                        kkey = str(kk)
-                        rs = _residual_horizon_score(yhat, y, kk, cfg)
-                        rz = _zscore(rs, eps=float(getattr(cfg, "residual_eps", 1e-6)))
-                        if kkey in y_cls_logits:
-                            y_cls_logits[kkey] = y_cls_logits[kkey] + float(cfg.residual_boost_alpha) * rz
+            # Apply residual fusion
+            mdl = unwrap_model(model)
+            yhat = torch.nan_to_num(y_pred, nan=0.0, posinf=1e6, neginf=-1e6)
+            ytrue = torch.nan_to_num(y, nan=0.0, posinf=1e6, neginf=-1e6)
 
             # BCE loss
             loss_cls = torch.tensor(0.0, device=cfg.device)
@@ -957,19 +1218,35 @@ def train_one_epoch(model, revin, loader, opt, scaler, cfg: TrainCfg, epoch: int
             for kk in cfg.horizons:
                 kk = int(kk)
                 kkey = str(kk)
-                if (kkey in y_cls_logits) and (kkey in y_cls_targets):
-                    logits = y_cls_logits[kkey]
-                    target = y_cls_targets[kkey]
+                if (kkey not in y_cls_logits) or (kkey not in y_cls_targets):
+                    continue
+                if kk < 1 or kk > cfg.L_pred:
+                    continue
 
-                    if cfg.use_ad:
-                        logits = logits + float(cfg.alpha_ad_logit) * ad_boost[kkey]
+                logits = y_cls_logits[kkey]
+                target = y_cls_targets[kkey]
 
-                    npos = target.sum().clamp_min(1.0)
-                    nneg = (target.numel() - target.sum()).clamp_min(1.0)
-                    pos_weight = (nneg / npos).detach()
+                # AD boost
+                if cfg.use_ad:
+                    logits = logits + float(cfg.alpha_ad_logit) * ad_boost[kkey]
 
-                    loss_cls = loss_cls + nn.BCEWithLogitsLoss(pos_weight=pos_weight)(logits, target)
-                    cnt += 1
+                # residual fusion next
+                feat_b4 = _residual_features_4(yhat, ytrue, kk, cfg)  # (B,4)
+                logits = apply_residual_fusion(
+                    mdl, cfg,
+                    logits_b=logits,
+                    feat_b4_raw=feat_b4,
+                    horizon_k=kk,
+                    update_ema=True
+                )
+
+                npos = target.sum().clamp_min(1.0)
+                nneg = (target.numel() - target.sum()).clamp_min(1.0)
+                pos_weight = (nneg / npos).detach()
+
+                loss_cls = loss_cls + nn.BCEWithLogitsLoss(pos_weight=pos_weight)(logits, target)
+                cnt += 1
+
             if cnt > 0:
                 loss_cls = loss_cls / cnt
 
@@ -1066,8 +1343,8 @@ def predict_cls_prob_on_test(model, revin, cfg: TrainCfg, loader_test, y_test_fu
     """
     DDP-safe + coverage-safe
     - assoc_last만으로 hybrid prior(JS) 계산해서 AD boost 적용
-    - splat=False: 해당 t에만 기록. score = sigmoid(mean_logit) 방식으로 분산 회복
-    - 출력/반환: AUROC 제거, AUPRC만 유지 (라벨: PAD-AUPRC)
+    - residual fusion도 평가에서 동일하게 적용 (y future가 loader에 있으므로 가능)
+    - splat=False: 해당 t에만 기록. score = sigmoid(mean_logit)
     """
     model.eval()
     T_test = int(len(y_test_full))
@@ -1080,27 +1357,40 @@ def predict_cls_prob_on_test(model, revin, cfg: TrainCfg, loader_test, y_test_fu
 
     if debug and ddp_rank0():
         print(f"[TEST] base rate (positive ratio) = {float(np.mean(y_true_full)):.6f} (T={T_test})")
-        print("[TEST] splat=False | score=sigmoid(mean_logit)")
+        print(f"[TEST] splat=False | score=sigmoid(mean_logit) | residual_fusion={cfg.residual_fusion} norm={cfg.residual_norm_mode}")
 
     for it, b in enumerate(loader_test):
         x_enc, t_enc, x_dec, t_dec, y, idxs = b
         x_enc = x_enc.to(cfg.device, non_blocking=True)
         x_dec = x_dec.to(cfg.device, non_blocking=True)
+        y = y.to(cfg.device, non_blocking=True)
         t_enc = t_enc.to(cfg.device, non_blocking=True) if t_enc is not None else None
         t_dec = t_dec.to(cfg.device, non_blocking=True) if t_dec is not None else None
         idxs_np = idxs.numpy()
 
         if cfg.use_revin and (revin is not None):
-            x_enc_n, _ = revin(x_enc, mode="norm")
+            x_enc_n, stats = revin(x_enc, mode="norm")
             x_dec_n, _ = revin(x_dec, mode="norm")
         else:
-            x_enc_n, x_dec_n = x_enc, x_dec
+            x_enc_n, x_dec_n, stats = x_enc, x_dec, None
 
+        # base cls logits + assoc
         y_reg_q, y_cls_logits, assoc_last, enc_attn_list, _ = model(
             x_enc_n, t_enc, x_dec_n, t_dec,
             return_assoc=cfg.use_ad,
             return_enc_attn=False
         )
+
+        # also get y_pred for residual features (evaluation only)
+        pred_n = decode_autoregressive(
+            model, revin, cfg,
+            x_enc_n, t_enc,
+            x_dec_n[:, :cfg.L_label, :], t_dec,
+            teacher_future_n=None, teacher_prob=0.0, train_mode=False
+        )
+        y_pred = _denorm_if_needed(pred_n, revin, stats, cfg.use_revin)
+        yhat = torch.nan_to_num(y_pred, nan=0.0, posinf=1e6, neginf=-1e6)
+        ytrue = torch.nan_to_num(y, nan=0.0, posinf=1e6, neginf=-1e6)
 
         B = x_enc.size(0)
 
@@ -1125,10 +1415,20 @@ def predict_cls_prob_on_test(model, revin, cfg: TrainCfg, loader_test, y_test_fu
                 if kk not in y_cls_logits:
                     continue
 
-                logits = y_cls_logits[kk][b_idx]
+                logits = y_cls_logits[kk][b_idx].unsqueeze(0)  # (1,)
                 if (z_map is not None) and (kk in z_map):
-                    logits = logits + float(cfg.alpha_ad_logit) * z_map[kk][b_idx]
-                p = float(torch.sigmoid(logits).item())
+                    logits = logits + float(cfg.alpha_ad_logit) * z_map[kk][b_idx].unsqueeze(0)
+
+                feat_b4 = _residual_features_4(yhat[b_idx:b_idx+1], ytrue[b_idx:b_idx+1], k, cfg)  # (1,4)
+                logits = apply_residual_fusion(
+                    mdl, cfg,
+                    logits_b=logits,
+                    feat_b4_raw=feat_b4,
+                    horizon_k=k,
+                    update_ema=False
+                )
+
+                p = float(torch.sigmoid(logits.squeeze(0)).item())
 
                 t = e_p + (k - 1)
                 if 0 <= t < T_test:
@@ -1185,7 +1485,7 @@ def predict_cls_prob_on_test(model, revin, cfg: TrainCfg, loader_test, y_test_fu
 
         if pv.size < 10 or np.unique(yv).size < 2:
             out[k] = dict(P=float("nan"), R=float("nan"), F1=float("nan"),
-                          AUPRC=float("nan"),
+                          AUPRC=float("nan"), PAD_AUPRC=float("nan"),
                           thr=float("nan"), n_valid=n_valid, cover=cover)
             continue
 
@@ -1212,11 +1512,16 @@ def predict_cls_prob_on_test(model, revin, cfg: TrainCfg, loader_test, y_test_fu
         P_raw, R_raw, F1_raw, _ = precision_recall_fscore_support(yv, pred, average="binary", zero_division=0)
         P, R, F1, _ = precision_recall_fscore_support(yv, pred_use, average="binary", zero_division=0)
 
-        # AUPRC only (no AUROC)
+        # Standard AUPRC (kept for reference)
         AUPRC = average_precision_score(yv, pv)
+
+        # PAD_AUPRC
+        pv_pad = pad_splat_scores_by_true_segments(yv, pv)
+        PAD_AUPRC = average_precision_score(yv, pv_pad)
 
         out[k] = dict(P=float(P), R=float(R), F1=float(F1),
                       AUPRC=float(AUPRC),
+                      PAD_AUPRC=float(PAD_AUPRC),
                       thr=float(thr), n_valid=n_valid, cover=cover)
 
         if bool(getattr(cfg, "use_event_metrics", True)):
@@ -1227,11 +1532,9 @@ def predict_cls_prob_on_test(model, revin, cfg: TrainCfg, loader_test, y_test_fu
 
         if debug and ddp_rank0():
             if bool(getattr(cfg, "use_point_adjust", False)):
-                print(f"[TEST][CLASS] k={k} thr={thr:.6f} "
-                      f"ADJ(F1={F1:.4f},P={P:.4f},R={R:.4f})")
+                print(f"[TEST][CLASS] k={k} thr={thr:.6f} ADJ(F1={F1:.4f},P={P:.4f},R={R:.4f}) | PAD_AUPRC={PAD_AUPRC:.6f}")
             else:
-                print(f"[TEST][CLASS] k={k} thr={thr:.6f} "
-                      f"F1={F1:.4f} P={P:.4f} R={R:.4f}")
+                print(f"[TEST][CLASS] k={k} thr={thr:.6f} F1={F1:.4f} P={P:.4f} R={R:.4f} | PAD_AUPRC={PAD_AUPRC:.6f}")
 
     return out
 
@@ -1273,13 +1576,6 @@ def build_time_seconds(seconds: np.ndarray):
 # =========================================================
 # scenario runner
 # =========================================================
-def _choose_sigmas(L_enc: int) -> Tuple[float, ...]:
-    if L_enc <= 96:
-        return (8.0, 32.0, 64.0)
-    if L_enc <= 144:
-        return (8.0, 32.0, 96.0)
-    return (8.0, 32.0, 96.0)
-
 def run_scenario(
     tag: str,
     horizons: Tuple[int, ...],
@@ -1303,11 +1599,14 @@ def run_scenario(
     cfg.L_label = cfg.L_enc // 4
 
     assert cfg.L_pred >= max(cfg.horizons), f"L_pred({cfg.L_pred}) must cover max horizon {max(cfg.horizons)}"
-    cfg.prior_sigmas = _choose_sigmas(cfg.L_enc)
+
+    cfg.prior_sigmas = tuple(float(s) for s in DEFAULT_BASELINE["prior_sigmas"])
 
     if ddp_rank0():
         print(f"\n=== [{tag}] horizons={cfg.horizons} | L_enc={cfg.L_enc} | L_label={cfg.L_label} | L_pred={cfg.L_pred} | epochs={cfg.epochs} ===")
         print(f"[{tag}] prior_sigmas={cfg.prior_sigmas} prior_beta={cfg.prior_beta}")
+        print(f"[{tag}] residual_norm_mode={cfg.residual_norm_mode} rs_ema_m={cfg.rs_ema_m} fusion={cfg.residual_fusion} "
+              f"(gate_lambda={cfg.gate_lambda}, alpha={cfg.residual_boost_alpha})")
 
     L = cfg.L_enc
     K = cfg.L_pred
@@ -1362,10 +1661,13 @@ def run_scenario(
         horizons_idx=cfg.horizons,
         quantiles=cfg.quantiles,
         prior_mix_k=len(cfg.prior_sigmas),
-        L_label=cfg.L_label
+        L_label=cfg.L_label,
+        rs_eps=cfg.residual_eps
     ).to(cfg.device)
 
     mdl = unwrap_model(model)
+
+    # init alpha logits
     hs = sorted(int(h) for h in cfg.horizons)
     w_short = torch.tensor([0.70, 0.25, 0.05], dtype=torch.float32, device=cfg.device)
     w_mid = torch.tensor([0.20, 0.60, 0.20], dtype=torch.float32, device=cfg.device)
@@ -1446,7 +1748,7 @@ def run_scenario(
                 if r is None:
                     continue
                 print(
-                    f"  k={k:3d} | F1={r['F1']:.4f} | PAD-AUPRC={r['AUPRC']:.4f} | thr={r['thr']:.6f}"
+                    f"  k={k:3d} | F1={r['F1']:.4f} | PAD_AUPRC={r.get('PAD_AUPRC', float('nan')):.4f} | thr={r['thr']:.6f}"
                 )
 
     if ddp_rank0():
@@ -1474,13 +1776,19 @@ def run_scenario(
             f"reg_{maxH}s_RMSE": float(ah["RMSE"]),
             f"reg_{maxH}s_sMAPE": float(ah["sMAPE%"]),
             f"reg_{maxH}s_MedAE": float(ah["MedianAE"]),
+
+            "residual_norm_mode": str(cfg.residual_norm_mode),
+            "rs_ema_m": float(cfg.rs_ema_m),
+            "residual_fusion": str(cfg.residual_fusion),
+            "gate_lambda": float(cfg.gate_lambda),
+            "residual_boost_alpha": float(cfg.residual_boost_alpha),
         }
 
         if cls_res is not None:
             for k in cfg.horizons:
                 k = int(k)
                 r = cls_res.get(k, None)
-                row[f"cls_AUPRC_k{k}"] = float(r.get("AUPRC", np.nan)) if r is not None else np.nan
+                row[f"cls_PAD_AUPRC_k{k}"] = float(r.get("PAD_AUPRC", np.nan)) if r is not None else np.nan
                 row[f"cls_F1_k{k}"] = float(r.get("F1", np.nan)) if r is not None else np.nan
                 row[f"cls_cover_k{k}"] = float(r.get("cover", np.nan)) if r is not None else np.nan
 
@@ -1512,15 +1820,23 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--device", type=str, default=None)
 
-    p.add_argument("--L_enc", type=int, default=192)
-    p.add_argument("--L_pred", type=int, default=60)
+    # baseline defaults
+    p.add_argument("--L_enc", type=int, default=int(DEFAULT_BASELINE["L_enc"]))
+    p.add_argument("--L_pred", type=int, default=int(DEFAULT_BASELINE["L_pred"]))
     p.add_argument("--hop", type=int, default=2)
-    p.add_argument("--horizons", nargs="+", type=int, default=[1, 60])
-    p.add_argument("--prior_beta", type=float, default=0.5)
-    p.add_argument("--betas", nargs="+", type=float, default=[0.3, 0.5, 0.7])
+    p.add_argument("--horizons", nargs="+", type=int, default=list(DEFAULT_BASELINE["horizons"]))
+    p.add_argument("--prior_beta", type=float, default=float(DEFAULT_BASELINE["prior_beta"]))
+    p.add_argument("--betas", nargs="+", type=float, default=[float(DEFAULT_BASELINE["prior_beta"])])
 
     p.add_argument("--ckpt_dir", type=str, default="checkpoints_multi")
     p.add_argument("--results_csv", type=str, default=None)
+
+    # residual options
+    p.add_argument("--residual_norm_mode", type=str, default="ema", choices=["ema", "batch", "none"])
+    p.add_argument("--rs_ema_m", type=float, default=0.995)
+    p.add_argument("--residual_fusion", type=str, default="gating", choices=["gating", "logit_add", "mlp"])
+    p.add_argument("--gate_lambda", type=float, default=0.15)
+    p.add_argument("--residual_boost_alpha", type=float, default=1.0)
 
     return p.parse_args()
 
@@ -1561,6 +1877,10 @@ def main():
         print(f"train shape: {x_train_df.shape} test shape: {x_test_df.shape}")
         print(f"y_test length: {len(y_test)}")
         print("[TIME] assume 1 step = 1 sec")
+        print("[BASELINE] default best pinned:")
+        print(f"  tag={DEFAULT_BASELINE['tag']} beta={DEFAULT_BASELINE['prior_beta']:.2f} "
+              f"L_enc={DEFAULT_BASELINE['L_enc']} L_pred={DEFAULT_BASELINE['L_pred']} "
+              f"horizons={DEFAULT_BASELINE['horizons']} sigmas={list(DEFAULT_BASELINE['prior_sigmas'])}")
 
     base_cfg = TrainCfg()
     base_cfg.device = device
@@ -1576,6 +1896,13 @@ def main():
 
     base_cfg.ckpt_dir = str(args.ckpt_dir)
     os.makedirs(base_cfg.ckpt_dir, exist_ok=True)
+
+    # residual options
+    base_cfg.residual_norm_mode = str(args.residual_norm_mode)
+    base_cfg.rs_ema_m = float(args.rs_ema_m)
+    base_cfg.residual_fusion = str(args.residual_fusion)
+    base_cfg.gate_lambda = float(args.gate_lambda)
+    base_cfg.residual_boost_alpha = float(args.residual_boost_alpha)
 
     results_csv_path = args.results_csv or os.path.join(base_cfg.ckpt_dir, "results.csv")
 
@@ -1598,11 +1925,9 @@ def main():
                 num_workers=int(args.num_workers),
             )
         else:
-            betas = [float(x) for x in args.betas]
+            betas = [float(DEFAULT_BASELINE["prior_beta"])]
             scenarios = [
-                ("H1_60", (1, 60), 192, 60),
-                ("H1_30", (1, 30), 144, 30),
-                ("H1_10", (1, 10), 96, 10),
+                (DEFAULT_BASELINE["tag"], DEFAULT_BASELINE["horizons"], DEFAULT_BASELINE["L_enc"], DEFAULT_BASELINE["L_pred"]),
             ]
             for prior_beta in betas:
                 for tag, horizons, L_enc, L_pred in scenarios:
@@ -1627,7 +1952,7 @@ def main():
         ddp_cleanup()
 
     # =====================================================
-    # summary (rank0 only) - uses AUPRC only
+    # summary (rank0 only)
     # =====================================================
     if ddp_rank0() and os.path.exists(results_csv_path):
         try:
@@ -1641,13 +1966,13 @@ def main():
                 print("[SUMMARY] results.csv is broken and backup failed.")
             return
 
-        auprc_cols = [c for c in df.columns if c.startswith("cls_AUPRC_k")]
-        if len(auprc_cols) == 0:
-            print("[SUMMARY] No AUPRC columns found in results.csv")
+        pad_cols = [c for c in df.columns if c.startswith("cls_PAD_AUPRC_k")]
+        if len(pad_cols) == 0:
+            print("[SUMMARY] No PAD_AUPRC columns found in results.csv")
             return
 
-        print("\n================= SUMMARY: Best (max AUPRC) per horizon =================")
-        for c in sorted(auprc_cols, key=lambda x: int(x.split("k")[-1])):
+        print("\n================= SUMMARY: Best (max PAD_AUPRC) per horizon =================")
+        for c in sorted(pad_cols, key=lambda x: int(x.split("k")[-1])):
             k = int(c.split("k")[-1])
             d = df.dropna(subset=[c]).copy()
             if len(d) == 0:
@@ -1655,24 +1980,24 @@ def main():
                 continue
             best = d.sort_values(c, ascending=False).iloc[0]
             print(
-                f"[BEST] k={k}: AUPRC={best[c]:.4f} | tag={best['tag']} beta={best['beta']:.2f} "
+                f"[BEST] k={k}: PAD_AUPRC={best[c]:.4f} | tag={best['tag']} beta={best['beta']:.2f} "
                 f"L_enc={int(best['L_enc'])} L_pred={int(best['L_pred'])} horizons={best['horizons']} "
                 f"sigmas={best['prior_sigmas']}"
             )
 
-        df["AUPRC_mean"] = df[auprc_cols].mean(axis=1, skipna=True)
-        best_mean = df.sort_values("AUPRC_mean", ascending=False).iloc[0]
-        print("\n================= SUMMARY: Best by mean AUPRC =================")
+        df["PAD_AUPRC_mean"] = df[pad_cols].mean(axis=1, skipna=True)
+        best_mean = df.sort_values("PAD_AUPRC_mean", ascending=False).iloc[0]
+        print("\n================= SUMMARY: Best by mean PAD_AUPRC =================")
         print(
-            f"[BEST-MEAN] meanAUPRC={best_mean['AUPRC_mean']:.4f} | tag={best_mean['tag']} beta={best_mean['beta']:.2f} "
+            f"[BEST-MEAN] meanPAD_AUPRC={best_mean['PAD_AUPRC_mean']:.4f} | tag={best_mean['tag']} beta={best_mean['beta']:.2f} "
             f"L_enc={int(best_mean['L_enc'])} L_pred={int(best_mean['L_pred'])} horizons={best_mean['horizons']} "
             f"sigmas={best_mean['prior_sigmas']}"
         )
 
-        topN = df.sort_values("AUPRC_mean", ascending=False).head(10)[
-            ["tag", "beta", "L_enc", "L_pred", "horizons", "prior_sigmas", "AUPRC_mean"] + auprc_cols
+        topN = df.sort_values("PAD_AUPRC_mean", ascending=False).head(10)[
+            ["tag", "beta", "L_enc", "L_pred", "horizons", "prior_sigmas", "PAD_AUPRC_mean"] + pad_cols
         ]
-        print("\n================= TOP 10 by mean AUPRC =================")
+        print("\n================= TOP 10 by mean PAD_AUPRC =================")
         print(topN.to_string(index=False))
 
 if __name__ == "__main__":
