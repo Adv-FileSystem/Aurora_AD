@@ -27,3 +27,4 @@
 - 2026-11-17 22:53:12 add log entry (#14)
 - 2026-11-17 22:53:17 update activity log (#15)
 - 2026-11-17 22:53:24 add log entry (#16)
+- 2026-11-17 22:53:27 tidy log formatting (#17)
